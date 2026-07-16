@@ -15,7 +15,11 @@
 #   9. glab unfetchable → block (2) — migration gate is fail-closed by design
 #  10. non-migration path → pass-through allow (0)
 #  11. no active-ticket marker → block (2)
-#  12. non-gh/glab (jira) reaches Gate 3, blocks with body-scoping note (2)
+#  12. jira happy path — ADF (Cloud) body links AgDR → allow (0) (#761)
+#  12b. jira happy path — plain-string (Server/DC) body links AgDR → allow (0)
+#  12c. linear happy path — description body links AgDR → allow (0) (#761)
+#  12d. asana happy path — notes body links AgDR → allow (0) (#761)
+#  12e. custom (body unmapped) reaches Gate 3, blocks with scoping note (2)
 #  13. injection: metachar marker `number=` → block (2) and NOT executed
 #  14. injection: metachar marker `repo=` → block (2) and NOT executed
 #  15. guard: `#`-prefixed number passes and is shell-safe (printf %q escapes #)
@@ -105,6 +109,22 @@ run_hook() {
   local sb="$1" file_path="$2" expected_rc="$3"
   local input rc
   input=$(jq -nc --arg fp "$file_path" '{tool_name:"Write", tool_input:{file_path:$fp}}')
+  (
+    cd "$sb" || exit 99
+    PATH="$sb/bin:$PATH" .claude/hooks/require-migration-ticket.sh <<<"$input" >/dev/null 2>&1
+  )
+  rc=$?
+  [ "$rc" = "$expected_rc" ]
+}
+
+# Run the hook (Bash tool) against a synthetic shell command; check exit code.
+# #886: used to prove the hook judges EVERY extracted write target, not
+# just the first — a command naming a non-migration path FIRST and a
+# migration path SECOND must still hit the migration gate on the second.
+run_hook_bash() {
+  local sb="$1" command="$2" expected_rc="$3"
+  local input rc
+  input=$(jq -nc --arg c "$command" '{tool_name:"Bash", tool_input:{command:$c}}')
   (
     cd "$sb" || exit 99
     PATH="$sb/bin:$PATH" .claude/hooks/require-migration-ticket.sh <<<"$input" >/dev/null 2>&1
@@ -321,9 +341,10 @@ fi
 rm -rf "$SB"
 
 # =============================================================================
-# Case 12: non-gh/glab tracker (jira) reaches Gate 3 but body is unmapped, so it
-# blocks with the scoping note (documents the known limitation; the migration
-# gate's body read is gh/glab-only until body support is widened).
+# Case 12: jira happy path (#761). Body is now mapped for jira, so an OPEN,
+# migration-labelled ticket whose ADF description (Jira Cloud) links a migration
+# AgDR passes Gate 3 → allow (0). This replaces the pre-#761 case that asserted
+# jira blocked with a body-scoping note (that limitation is now closed).
 # =============================================================================
 SB=$(make_fork)
 cat > "$SB/.claude/project-config.json" <<'JSON'
@@ -332,22 +353,113 @@ JSON
 set_marker "$SB" test-org/test-repo JIRA-42
 install_mock "$SB" jira '
 if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
-  printf "{\"self\":\"https://jira/JIRA-42\",\"fields\":{\"status\":{\"name\":\"In Progress\"},\"summary\":\"S\",\"labels\":[\"migration\"]}}\n"
+  printf "{\"self\":\"https://jira/JIRA-42\",\"fields\":{\"status\":{\"name\":\"In Progress\"},\"summary\":\"S\",\"labels\":[\"migration\"],\"description\":{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"refs docs/agdr/AgDR-0011-schema-migration.md\"}]}]}}}\n"
   exit 0
 fi
 exit 0
 '
-# Capture stderr to assert the scoping note is present.
+if run_hook "$SB" "$SB/$MIG" 0; then
+  record_pass "jira: OPEN + migration label + AgDR in ADF body → allow (#761)"
+else
+  record_fail "jira: OPEN + migration label + AgDR in ADF body → allow (#761)"
+fi
+rm -rf "$SB"
+
+# =============================================================================
+# Case 12b: jira Server/DC plain-string description → allow (#761). Same as 12
+# but the description comes back as a plain string (not ADF), exercising the
+# adapter's string pass-through branch.
+# =============================================================================
+SB=$(make_fork)
+cat > "$SB/.claude/project-config.json" <<'JSON'
+{ "tracker": { "kind": "jira", "view_command": "jira issue view {id} --raw" } }
+JSON
+set_marker "$SB" test-org/test-repo JIRA-43
+install_mock "$SB" jira '
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  printf "{\"self\":\"https://jira/JIRA-43\",\"fields\":{\"status\":{\"name\":\"In Progress\"},\"summary\":\"S\",\"labels\":[\"migration\"],\"description\":\"refs docs/agdr/AgDR-0012-data-migration.md\"}}\n"
+  exit 0
+fi
+exit 0
+'
+if run_hook "$SB" "$SB/$MIG" 0; then
+  record_pass "jira: OPEN + label + AgDR in plain-string (Server/DC) body → allow (#761)"
+else
+  record_fail "jira: OPEN + label + AgDR in plain-string (Server/DC) body → allow (#761)"
+fi
+rm -rf "$SB"
+
+# =============================================================================
+# Case 12c: linear happy path (#761). Body maps to .description (markdown).
+# =============================================================================
+SB=$(make_fork)
+cat > "$SB/.claude/project-config.json" <<'JSON'
+{ "tracker": { "kind": "linear", "view_command": "linear issue view {id} --json" } }
+JSON
+set_marker "$SB" test-org/test-repo LIN-42
+install_mock "$SB" linear '
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  printf "{\"state\":{\"name\":\"In Progress\"},\"title\":\"L\",\"url\":\"https://linear/LIN-42\",\"labels\":[{\"name\":\"migration\"}],\"description\":\"refs docs/agdr/AgDR-0013-schema-migration.md\"}\n"
+  exit 0
+fi
+exit 0
+'
+if run_hook "$SB" "$SB/$MIG" 0; then
+  record_pass "linear: OPEN + migration label + AgDR in description body → allow (#761)"
+else
+  record_fail "linear: OPEN + migration label + AgDR in description body → allow (#761)"
+fi
+rm -rf "$SB"
+
+# =============================================================================
+# Case 12d: asana happy path (#761). Body maps to .notes; state derives from
+# .completed (false → Open). Asana uses a numeric task gid.
+# =============================================================================
+SB=$(make_fork)
+cat > "$SB/.claude/project-config.json" <<'JSON'
+{ "tracker": { "kind": "asana", "view_command": "asana task get {id} --json" } }
+JSON
+set_marker "$SB" test-org/test-repo 1122334455
+install_mock "$SB" asana '
+if [ "$1" = "task" ] && [ "$2" = "get" ]; then
+  printf "{\"data\":{\"name\":\"A\",\"completed\":false,\"permalink_url\":\"https://asana/1\",\"tags\":[{\"name\":\"migration\"}],\"notes\":\"refs docs/agdr/AgDR-0014-schema-migration.md\"}}\n"
+  exit 0
+fi
+exit 0
+'
+if run_hook "$SB" "$SB/$MIG" 0; then
+  record_pass "asana: Open + migration tag + AgDR in notes body → allow (#761)"
+else
+  record_fail "asana: Open + migration tag + AgDR in notes body → allow (#761)"
+fi
+rm -rf "$SB"
+
+# =============================================================================
+# Case 12e: custom tracker WITHOUT body still reaches Gate 3 with an empty body
+# and blocks WITH the scoping note. Custom is deliberately out of #761 scope —
+# its body depends on the operator's normalise_jq — so the KIND_NOTE path must
+# still fire for it (and must NOT name jira/linear/asana as unsupported).
+# =============================================================================
+SB=$(make_fork)
+cat > "$SB/.claude/project-config.json" <<'JSON'
+{ "tracker": { "kind": "custom", "view_command": "customcli view {id}" } }
+JSON
+set_marker "$SB" test-org/test-repo CUST-42
+# Identity normalise (default): raw already shaped as {state,labels}; no body key.
+install_mock "$SB" customcli '
+printf "{\"state\":\"OPEN\",\"labels\":[\"migration\"]}\n"
+exit 0
+'
 OUT=$(
   cd "$SB" || exit 99
   PATH="$SB/bin:$PATH" .claude/hooks/require-migration-ticket.sh \
     <<<"$(jq -nc --arg fp "$SB/$MIG" '{tool_name:"Write", tool_input:{file_path:$fp}}')" 2>&1
 )
 RC=$?
-if [ "$RC" = "2" ] && echo "$OUT" | grep -q "tracker.kind=jira"; then
-  record_pass "jira: Gate 3 blocks with body-scoping note (known gh/glab-only limitation)"
+if [ "$RC" = "2" ] && echo "$OUT" | grep -q "tracker.kind=custom"; then
+  record_pass "custom: Gate 3 blocks with body-scoping note (custom out of #761 scope)"
 else
-  record_fail "jira: Gate 3 blocks with body-scoping note (known gh/glab-only limitation)" "rc=$RC note-present=$(echo "$OUT" | grep -c 'tracker.kind=jira')"
+  record_fail "custom: Gate 3 blocks with body-scoping note (custom out of #761 scope)" "rc=$RC note-present=$(echo "$OUT" | grep -c 'tracker.kind=custom')"
 fi
 rm -rf "$SB"
 
@@ -401,6 +513,119 @@ if run_hook "$SB" "$SB/$MIG" 0; then
   record_pass "guard: #-prefixed number passes and is shell-safe (printf %q escapes #)"
 else
   record_fail "guard: #-prefixed number passes and is shell-safe (printf %q escapes #)"
+fi
+rm -rf "$SB"
+
+# =============================================================================
+# Case 16: #886 — Bash command names a NON-migration target FIRST and a
+# migration-path target SECOND. With an OPEN, labelled, AgDR-linked ticket
+# → allow (0). Before #886, the hook judged only the first extracted
+# target (src/app.ts, not migration-shaped) and exited 0 without ever
+# consulting the tracker for the second target — this proves the second
+# target is now the one that drives the gate.
+# =============================================================================
+SB=$(make_fork)
+set_marker "$SB" test-org/test-repo 42
+install_mock "$SB" gh "$GH_OPEN_OK"
+if run_hook_bash "$SB" "echo x > src/app.ts; echo y > ./$MIG" 0; then
+  record_pass "#886 bash: non-migration target then migration target, valid ticket → allow"
+else
+  record_fail "#886 bash: non-migration target then migration target, valid ticket → allow"
+fi
+rm -rf "$SB"
+
+# =============================================================================
+# Case 17: #886 — same shape, but NO active-ticket marker at all → block (2).
+# Confirms Gate 1 fires for the migration-shaped SECOND target even though
+# the FIRST target in the command is an ordinary source file.
+# =============================================================================
+SB=$(make_fork)
+install_mock "$SB" gh 'exit 99'
+if run_hook_bash "$SB" "echo x > src/app.ts; echo y > ./$MIG" 2; then
+  record_pass "#886 bash: non-migration target then migration target, no ticket → block"
+else
+  record_fail "#886 bash: non-migration target then migration target, no ticket → block"
+fi
+rm -rf "$SB"
+
+# =============================================================================
+# Case 18: #886/#926 (Hakim security-review finding) — NO-SPACE `;` then
+# redirect into a migration path: `echo x > src/app.ts;> ./migrations/...`.
+# After splitting on `;`, the second segment BEGINS with `>` (no space
+# between the separator and the redirection) — the pre-fix regex required
+# a character before `>` to exist, so this migration-shaped target was
+# silently dropped and the command passed through ungated. No ticket →
+# block (2).
+# =============================================================================
+SB=$(make_fork)
+install_mock "$SB" gh 'exit 99'
+if run_hook_bash "$SB" "echo x > src/app.ts;> ./$MIG" 2; then
+  record_pass "#886 bash: no-space ';' into migration target, no ticket → block"
+else
+  record_fail "#886 bash: no-space ';' into migration target, no ticket → block"
+fi
+rm -rf "$SB"
+
+# =============================================================================
+# Case 19: #886/#926 round 3 (Hakim adversarial re-hunt) — `&>` (redirect
+# BOTH stdout and stderr to a file) directly into a migration path. The
+# pre-round-3 operator alternation only modelled `>`/`>>`/`n>`; it missed
+# `&>` entirely. No ticket → block (2).
+# =============================================================================
+SB=$(make_fork)
+install_mock "$SB" gh 'exit 99'
+if run_hook_bash "$SB" "echo x &> ./$MIG" 2; then
+  record_pass "#886 bash: '&>' directly into migration target, no ticket → block"
+else
+  record_fail "#886 bash: '&>' directly into migration target, no ticket → block"
+fi
+rm -rf "$SB"
+
+# =============================================================================
+# Case 20: #886/#926 round 3 — `>|` (force-clobber) after a no-space `;`,
+# non-migration target FIRST, migration target SECOND. Same shape as case
+# 18 but with the force-clobber operator instead of a plain redirect. No
+# ticket → block (2).
+# =============================================================================
+SB=$(make_fork)
+install_mock "$SB" gh 'exit 99'
+if run_hook_bash "$SB" "echo x > src/app.ts;>| ./$MIG" 2; then
+  record_pass "#886 bash: '>|' force-clobber into migration target, no ticket → block"
+else
+  record_fail "#886 bash: '>|' force-clobber into migration target, no ticket → block"
+fi
+rm -rf "$SB"
+
+# =============================================================================
+# Case 21: #886/#926 round 4 (Hakim's fourth adversarial re-hunt) — ZERO
+# whitespace between the operator and the migration-path target:
+# `echo x > src/app.ts;>./migrations/...` (no space after the `;>`). The
+# mandatory whitespace requirement this pattern used through round 3 was
+# itself a bypass — bash accepts zero whitespace here. No ticket → block (2).
+# =============================================================================
+SB=$(make_fork)
+install_mock "$SB" gh 'exit 99'
+if run_hook_bash "$SB" "echo x > src/app.ts;>./$MIG" 2; then
+  record_pass "#886 bash: no-space '>' into migration target, no ticket → block"
+else
+  record_fail "#886 bash: no-space '>' into migration target, no ticket → block"
+fi
+rm -rf "$SB"
+
+# =============================================================================
+# Case 22: #886/#926 round 5 (Hakim's fifth adversarial re-hunt — the
+# STRUCTURAL fix). DETECTION (bash_command_appears_to_write) used to run
+# the redirection matcher on the WHOLE, unsplit command; a `|`-preceded
+# `>` (from `||`) is excluded by the leading-context class and isn't at
+# `^` either, so `false ||> ./migrations/...` was never even recognised
+# as a write. No ticket → block (2).
+# =============================================================================
+SB=$(make_fork)
+install_mock "$SB" gh 'exit 99'
+if run_hook_bash "$SB" "false ||> ./$MIG" 2; then
+  record_pass "#886 bash: '||>' directly into migration target, no ticket → block"
+else
+  record_fail "#886 bash: '||>' directly into migration target, no ticket → block"
 fi
 rm -rf "$SB"
 
